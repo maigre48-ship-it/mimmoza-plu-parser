@@ -1,0 +1,19 @@
+{
+  "name": "mimmoza-plu-parser",
+  "version": "1.0.0",
+  "description": "Moteur de parsing PLU pour Mimmoza – extrait les règles d’urbanisme depuis un PDF de PLU",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "openai": "^4.47.3",
+    "pdf-parse": "^1.1.1"
+  },
+  "author": "Mimmoza",
+  "license": "MIT"
+}
