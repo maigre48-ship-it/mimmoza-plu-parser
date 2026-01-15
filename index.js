@@ -4,6 +4,7 @@ import express from "express";
 import OpenAI from "openai";
 import pdf from "pdf-parse";
 
+console.log("🚀 PLU PARSER MODE=target_zone supported");
 console.log(
   "🔑 OPENAI_API_KEY prefix =",
   (process.env.OPENAI_API_KEY || "").slice(0, 15),
@@ -40,6 +41,17 @@ function normalizeText(text) {
     .replace(/\n{3,}/g, "\n\n");
 }
 
+/**
+ * Normalize a zone code: trim, uppercase, remove "Zone " prefix if present
+ */
+function normalizeZoneCode(code) {
+  if (!code) return null;
+  let normalized = code.trim().toUpperCase();
+  // Remove "ZONE " prefix if present
+  normalized = normalized.replace(/^ZONE\s+/i, "");
+  return normalized || null;
+}
+
 function parseFrenchDecimal(str) {
   if (!str) return null;
   const cleaned = str.replace(",", ".").replace(/\s/g, "");
@@ -47,12 +59,23 @@ function parseFrenchDecimal(str) {
   return isNaN(num) ? null : num;
 }
 
+/*
+ * Regex lookahead test cases for meter exclusion:
+ * - "12 m²"  -> must NOT match (surface, not distance)
+ * - "12 m ²" -> must NOT match (surface with space before ²)
+ * - "12 m2"  -> must NOT match (surface written as m2)
+ * - "5 m"    -> must MATCH (valid distance in meters)
+ * - "5m"     -> must MATCH (valid distance without space)
+ */
+
 function extractMetersValue(text) {
   if (!text) return null;
-  // Match patterns like "5 m", "5m", "5 mètres", but avoid "5 m²"
+  // Match patterns like "5 m", "5m", "5 mètres", but avoid "5 m²", "5 m2", "5 m ²"
+  // Lookahead (?!\s*(?:²|2)) ensures we don't match surfaces
+  // Lookahead (?!\s*(?:²|2|\d)) also excludes "m10" style patterns
   const patterns = [
-    /(\d+(?:[.,]\d+)?)\s*m(?:è|e)?tres?(?!\s*²|2)/gi,
-    /(\d+(?:[.,]\d+)?)\s*m(?!\s*²|2|\d)/gi,
+    /(\d+(?:[.,]\d+)?)\s*m(?:è|e)?tres?(?!\s*(?:²|2))/gi,
+    /(\d+(?:[.,]\d+)?)\s*m(?!\s*(?:²|2|\d))/gi,
   ];
   for (const pattern of patterns) {
     const match = text.match(pattern);
@@ -68,11 +91,12 @@ function extractMetersValue(text) {
 
 function extractMinimumMeters(text) {
   if (!text) return null;
+  // Lookahead (?!\s*(?:²|2)) excludes m², m2, m ² patterns
   const patterns = [
-    /minimum\s+(?:de\s+)?(\d+(?:[.,]\d+)?)\s*m(?!\s*²|2)/gi,
-    /mini(?:mum)?\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*m(?!\s*²|2)/gi,
-    /au\s+moins\s+(\d+(?:[.,]\d+)?)\s*m(?!\s*²|2)/gi,
-    /(\d+(?:[.,]\d+)?)\s*m(?!\s*²|2)\s+(?:au\s+)?minimum/gi,
+    /minimum\s+(?:de\s+)?(\d+(?:[.,]\d+)?)\s*m(?!\s*(?:²|2))/gi,
+    /mini(?:mum)?\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*m(?!\s*(?:²|2))/gi,
+    /au\s+moins\s+(\d+(?:[.,]\d+)?)\s*m(?!\s*(?:²|2))/gi,
+    /(\d+(?:[.,]\d+)?)\s*m(?!\s*(?:²|2))\s+(?:au\s+)?minimum/gi,
   ];
   for (const pattern of patterns) {
     const match = text.match(pattern);
@@ -158,10 +182,11 @@ function extractPlacesPar100m2(text) {
 
 function extractHauteurMax(text) {
   if (!text) return null;
+  // Lookahead (?!\s*(?:²|2)) excludes m², m2, m ² patterns
   const patterns = [
-    /hauteur\s+(?:maximale?|max\.?|maximum)\s*(?:de\s+|[:=])?\s*(\d+(?:[.,]\d+)?)\s*m(?!\s*²|2)/gi,
-    /(\d+(?:[.,]\d+)?)\s*m(?!\s*²|2)\s*(?:de\s+)?hauteur\s+max/gi,
-    /h\.?\s*max\.?\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*m(?!\s*²|2)/gi,
+    /hauteur\s+(?:maximale?|max\.?|maximum)\s*(?:de\s+|[:=])?\s*(\d+(?:[.,]\d+)?)\s*m(?!\s*(?:²|2))/gi,
+    /(\d+(?:[.,]\d+)?)\s*m(?!\s*(?:²|2))\s*(?:de\s+)?hauteur\s+max/gi,
+    /h\.?\s*max\.?\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*m(?!\s*(?:²|2))/gi,
   ];
   for (const pattern of patterns) {
     const match = text.match(pattern);
@@ -598,6 +623,9 @@ app.post("/api/plu-parse", async (req, res) => {
     zones_detected: 0,
     zones_processed: 0,
     used_discovery: "regex",
+    target_zone_mode: false,
+    target_zone_code: null,
+    target_zone_found_in_discovery: false,
     warnings: [],
   };
 
@@ -610,10 +638,20 @@ app.post("/api/plu-parse", async (req, res) => {
       return res.status(401).json({ success: false, error: "UNAUTHORIZED" });
     }
 
-    const { commune_insee, commune_nom, source_pdf_url } = req.body || {};
+    const { commune_insee, commune_nom, source_pdf_url, target_zone_code: rawTargetZone } = req.body || {};
 
     if (!commune_insee || !source_pdf_url) {
       return res.status(400).json({ success: false, error: "MISSING_PARAMS" });
+    }
+
+    // Normalize target_zone_code if provided
+    const targetZoneCode = normalizeZoneCode(rawTargetZone);
+    const isTargetZoneMode = !!targetZoneCode;
+
+    if (isTargetZoneMode) {
+      meta.target_zone_mode = true;
+      meta.target_zone_code = targetZoneCode;
+      console.log(`[PLU-PARSER] 🎯 TARGET_ZONE_MODE: ${targetZoneCode}`);
     }
 
     console.log(`[PLU-PARSER] Commune ${commune_nom || "?"} (${commune_insee}) - PDF:`, source_pdf_url);
@@ -655,62 +693,98 @@ app.post("/api/plu-parse", async (req, res) => {
     console.log(`[PLU-PARSER] Extracted ${fullText.length} chars`);
 
     // 4️⃣ Discovery: zones + plu_version_label
-    let zones = [];
+    let discoveredZones = [];
     let plu_version_label = extractPluVersionLabel(fullText);
 
     // Try regex first
     const regexZones = discoverZonesRegex(fullText);
     
     if (regexZones.length > 0) {
-      zones = regexZones.map((code) => ({ zone_code: code, zone_libelle: null }));
+      discoveredZones = regexZones.map((code) => ({ zone_code: code, zone_libelle: null }));
       meta.used_discovery = "regex";
-      console.log(`[PLU-PARSER] Regex discovered ${zones.length} zones:`, regexZones);
+      console.log(`[PLU-PARSER] Regex discovered ${discoveredZones.length} zones:`, regexZones);
     } else {
       // Fallback to LLM discovery
       console.log("[PLU-PARSER] Regex found no zones, using LLM discovery...");
       try {
         const discovery = await discoverZonesLLM(fullText, openai);
-        zones = discovery.zones || [];
+        discoveredZones = discovery.zones || [];
         plu_version_label = plu_version_label || discovery.plu_version_label;
         meta.used_discovery = "llm";
-        console.log(`[PLU-PARSER] LLM discovered ${zones.length} zones`);
+        console.log(`[PLU-PARSER] LLM discovered ${discoveredZones.length} zones`);
       } catch (err) {
         console.error("[PLU-PARSER] LLM discovery error:", err.message);
         warnings.push("LLM_DISCOVERY_FAILED");
       }
     }
 
-    meta.zones_detected = zones.length;
+    meta.zones_detected = discoveredZones.length;
 
-    if (zones.length === 0) {
-      return res.status(200).json({
-        success: false,
-        error: "NO_ZONES_FOUND",
-        commune_insee,
-        commune_nom: commune_nom || null,
-        plu_version_label,
-        source_document: source_pdf_url,
-        zones_rulesets: [],
-        meta: { ...meta, warnings },
-      });
+    // 5️⃣ Determine zones to process
+    let zonesToProcess = [];
+
+    if (isTargetZoneMode) {
+      // TARGET ZONE MODE: only process the target zone
+      const foundInDiscovery = discoveredZones.find(
+        (z) => normalizeZoneCode(z.zone_code) === targetZoneCode
+      );
+
+      if (foundInDiscovery) {
+        meta.target_zone_found_in_discovery = true;
+        zonesToProcess = [foundInDiscovery];
+        console.log(`[PLU-PARSER] 🎯 Target zone ${targetZoneCode} FOUND in discovery`);
+      } else {
+        // Target zone not found in discovery, but we still try to extract it
+        meta.target_zone_found_in_discovery = false;
+        zonesToProcess = [{ zone_code: targetZoneCode, zone_libelle: null }];
+        console.log(`[PLU-PARSER] 🎯 Target zone ${targetZoneCode} NOT in discovery, attempting extraction anyway`);
+        warnings.push(`TARGET_ZONE_NOT_IN_DISCOVERY: ${targetZoneCode}`);
+      }
+    } else {
+      // STANDARD MODE: process all discovered zones (up to 12)
+      if (discoveredZones.length === 0) {
+        return res.status(200).json({
+          success: false,
+          error: "NO_ZONES_FOUND",
+          commune_insee,
+          commune_nom: commune_nom || null,
+          plu_version_label,
+          source_document: source_pdf_url,
+          zones_rulesets: [],
+          meta: { ...meta, warnings },
+        });
+      }
+
+      zonesToProcess = discoveredZones;
+
+      // Limit to 12 zones in standard mode
+      if (zonesToProcess.length > 12) {
+        warnings.push(`ZONES_TRUNCATED: ${zonesToProcess.length} detected, processing first 12`);
+        zonesToProcess = zonesToProcess.slice(0, 12);
+      }
     }
 
-    // Limit to 12 zones
-    if (zones.length > 12) {
-      warnings.push(`ZONES_TRUNCATED: ${zones.length} detected, processing first 12`);
-      zones = zones.slice(0, 12);
-    }
-
-    // 5️⃣ Process each zone
+    // 6️⃣ Process zones
     const zones_rulesets = [];
 
-    for (const zoneInfo of zones) {
+    for (const zoneInfo of zonesToProcess) {
       const { zone_code, zone_libelle } = zoneInfo;
       console.log(`[PLU-PARSER] Processing zone ${zone_code}...`);
 
       try {
         // Build excerpts
         const excerpts = buildZoneExcerpts(fullText, zone_code);
+
+        // Log excerpt lengths for target zone mode
+        if (isTargetZoneMode) {
+          console.log(`[PLU-PARSER] 🎯 Excerpts for ${zone_code}:`);
+          console.log(`  - Article 6: ${excerpts.extrait_article_6.length} chars`);
+          console.log(`  - Article 7: ${excerpts.extrait_article_7.length} chars`);
+          console.log(`  - Article 12: ${excerpts.extrait_article_12.length} chars`);
+          console.log(`  - Article 9: ${excerpts.extrait_article_9.length} chars`);
+          console.log(`  - Article 10: ${excerpts.extrait_article_10.length} chars`);
+          console.log(`  - Fallback: ${excerpts.fallback_context.length} chars`);
+        }
 
         // LLM extraction
         const rawRuleset = await extractZoneRulesLLM(openai, zone_code, zone_libelle, excerpts);
@@ -753,7 +827,7 @@ app.post("/api/plu-parse", async (req, res) => {
 
     meta.warnings = warnings;
 
-    // 6️⃣ Return result
+    // 7️⃣ Return result
     const success = zones_rulesets.some(
       (z) => z.ruleset && !z.ruleset.reculs?.voirie?.note?.includes("LLM_FAILED")
     );
